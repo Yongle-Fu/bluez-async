@@ -19,7 +19,7 @@ pub struct DeviceId {
 }
 
 impl DeviceId {
-    pub(crate) fn new(object_path: &str) -> Self {
+    pub fn new(object_path: &str) -> Self {
         Self {
             object_path: object_path.to_owned().into(),
         }
@@ -39,6 +39,10 @@ impl From<DeviceId> for Path<'static> {
     fn from(id: DeviceId) -> Self {
         id.object_path
     }
+
+    // fn from_str(s: &str) -> Self {
+    //     Self::new(s)
+    // }
 }
 
 impl Display for DeviceId {
