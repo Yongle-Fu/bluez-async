@@ -19,7 +19,7 @@ pub struct DeviceId {
 }
 
 impl DeviceId {
-    pub(crate) fn new(object_path: &str) -> Self {
+    pub fn new(object_path: &str) -> Self {
         Self {
             object_path: object_path.to_owned().into(),
         }
