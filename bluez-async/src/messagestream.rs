@@ -36,7 +36,89 @@ impl Stream for MessageStream {
 impl Drop for MessageStream {
     fn drop(&mut self) {
         let connection = self.connection.clone();
-        let msg_match = self.msg_match.take().unwrap();
-        tokio::spawn(async move { connection.remove_match(msg_match.token()).await.unwrap() });
+        let Some(msg_match) = self.msg_match.take() else {
+            return;
+        };
+        // Drop can run after the runtime or D-Bus subscription has already closed.
+        // Cleanup is best-effort and must never abort a release-mode SDK host.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            // Keep the receiver alive until the match is removed. Otherwise a queued
+            // signal can fail delivery and remove the local token before cleanup runs.
+            let (_, empty_receiver) = futures::channel::mpsc::unbounded();
+            let events = std::mem::replace(&mut self.events, empty_receiver);
+            runtime.spawn(async move {
+                if let Err(error) = connection.remove_match(msg_match.token()).await {
+                    log::warn!(
+                        "Failed to remove D-Bus message subscription during cleanup: {error}"
+                    );
+                }
+                drop(events);
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use dbus::{
+        message::MatchRule,
+        nonblock::{Process, Proxy},
+    };
+    use std::{collections::HashMap, time::Duration};
+
+    async fn check_cleanup(deliver_queued_signal: bool) {
+        let (resource, connection) = dbus_tokio::connection::new_session_sync().unwrap();
+        let resource_task = tokio::spawn(async { resource.await });
+        let owner = connection.unique_name().to_string();
+        let rule = MatchRule::new_signal("com.brainco.CleanupTest", "Tick");
+        let msg_match = connection.add_match(rule).await.unwrap();
+        let stream = MessageStream::new(msg_match, connection.clone());
+        drop(stream);
+        if deliver_queued_signal {
+            // A current-thread runtime defers spawned cleanup until the next await.
+            connection.process_one(
+                Message::new_signal("/com/brainco/test", "com.brainco.CleanupTest", "Tick")
+                    .unwrap(),
+            );
+        }
+        let proxy = Proxy::new(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            Duration::from_secs(1),
+            connection,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (rules,): (HashMap<String, Vec<String>>,) = proxy
+                    .method_call("org.freedesktop.DBus.Debug.Stats", "GetAllMatchRules", ())
+                    .await
+                    .unwrap();
+                if !rules
+                    .get(&owner)
+                    .into_iter()
+                    .flatten()
+                    .any(|rule| rule.contains("com.brainco.CleanupTest"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        resource_task.abort();
+        assert!(result.is_ok(), "message-stream cleanup leaked a bus match");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires an isolated dbus-run-session with Debug.Stats"]
+    async fn message_stream_cleanup_with_queued_signal() {
+        check_cleanup(true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires an isolated dbus-run-session with Debug.Stats"]
+    async fn message_stream_cleanup_without_queued_signal() {
+        check_cleanup(false).await;
     }
 }
